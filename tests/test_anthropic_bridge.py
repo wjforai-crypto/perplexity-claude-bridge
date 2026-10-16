@@ -191,5 +191,89 @@ class BridgeTests(unittest.TestCase):
             r=self.post(stream=True)
             self.assertIn('file_upload_rate_limited',r.text)
             self.assertNotIn('"type": "tool_use"',r.text)
+    def test_loop_guard_interrupts_snapshot_rereads(self):
+        snap='private/context-cache/ab12cd/context.txt'
+        messages=[{'role':'user','content':'ORIGINAL_TASK_900: finish the deck.'}]
+        for i in range(6):
+            messages.extend([
+                {'role':'assistant','content':[{'type':'tool_use','id':f'r{i}','name':'Read','input':{'file_path':snap}}]},
+                {'role':'user','content':[{'type':'tool_result','tool_use_id':f'r{i}','content':'tail lines, no new info'}]}])
+        self.answers=[json.dumps({'text':'ok','tool_calls':[]})]
+        r=self.post(messages=messages,tools=[TOOL])
+        self.assertEqual(r.status_code,200)
+        self.assertIn('LOOP GUARD',self.captured[-1]['query'])
+        self.assertIn('6 consecutive tool turns',self.captured[-1]['query'])
+    def test_loop_guard_quiet_below_threshold(self):
+        snap='private/context-cache/ab12cd/context.txt'
+        messages=[{'role':'user','content':'ORIGINAL_TASK_901: finish the deck.'}]
+        for i in range(3):
+            messages.extend([
+                {'role':'assistant','content':[{'type':'tool_use','id':f'r{i}','name':'Read','input':{'file_path':snap}}]},
+                {'role':'user','content':[{'type':'tool_result','tool_use_id':f'r{i}','content':'lines'}]}])
+        self.answers=[json.dumps({'text':'ok','tool_calls':[]})]
+        r=self.post(messages=messages,tools=[TOOL])
+        self.assertEqual(r.status_code,200)
+        self.assertNotIn('LOOP GUARD',self.captured[-1]['query'])
+    def test_loop_guard_reset_by_real_user_text(self):
+        snap='private/context-cache/ab12cd/context.txt'
+        messages=[{'role':'user','content':'ORIGINAL_TASK_902: finish the deck.'}]
+        for i in range(6):
+            messages.extend([
+                {'role':'assistant','content':[{'type':'tool_use','id':f'r{i}','name':'Read','input':{'file_path':snap}}]},
+                {'role':'user','content':[{'type':'tool_result','tool_use_id':f'r{i}','content':'lines'}]}])
+        messages.append({'role':'user','content':'New instruction: stop reading and summarize.'})
+        self.answers=[json.dumps({'text':'ok','tool_calls':[]})]
+        r=self.post(messages=messages,tools=[TOOL])
+        self.assertEqual(r.status_code,200)
+        self.assertNotIn('LOOP GUARD',self.captured[-1]['query'])
+
+    def snapshot_reads(self, offsets, evidence, paths=None):
+        messages=[{'role':'user','content':'Finish the original task.'}]
+        for i,offset in enumerate(offsets):
+            path=paths[i] if paths else 'private/context-cache/ab12cd/context.txt'
+            messages.extend([
+                {'role':'assistant','content':[{'type':'tool_use','id':f'r{i}','name':'Read',
+                    'input':{'file_path':path,'offset':offset,'limit':20}}]},
+                {'role':'user','content':[{'type':'tool_result','tool_use_id':f'r{i}',
+                    'content':evidence[i]}]}])
+        return messages
+
+    def test_loop_guard_allows_advancing_ranges_even_if_text_matches(self):
+        for evidence in (['same boilerplate']*6,[f'new evidence {i}' for i in range(6)]):
+            with self.subTest(evidence=evidence):
+                messages=self.snapshot_reads([1,21,41,61,81,101],evidence)
+                self.answers=[json.dumps({'text':'ok','tool_calls':[]})]
+                self.assertEqual(self.post(messages=messages,tools=[TOOL]).status_code,200)
+                self.assertNotIn('LOOP GUARD',self.captured[-1]['query'])
+
+    def test_loop_guard_allows_new_evidence_from_same_range(self):
+        messages=self.snapshot_reads([1]*6,[f'new evidence {i}' for i in range(6)])
+        self.answers=[json.dumps({'text':'ok','tool_calls':[]})]
+        self.assertEqual(self.post(messages=messages,tools=[TOOL]).status_code,200)
+        self.assertNotIn('LOOP GUARD',self.captured[-1]['query'])
+
+    def test_loop_guard_detects_identical_evidence_across_snapshot_hashes(self):
+        paths=[f'private/context-cache/hash{i}/context.txt' for i in range(6)]
+        messages=self.snapshot_reads([101]*6,['same evidence']*6,paths)
+        self.answers=[json.dumps({'text':'ok','tool_calls':[]})]
+        self.assertEqual(self.post(messages=messages,tools=[TOOL]).status_code,200)
+        self.assertIn('LOOP GUARD',self.captured[-1]['query'])
+
+    def test_loop_guard_distinguishes_snapshot_files(self):
+        paths=[f'private/context-cache/hash/{name}' for name in
+               ('context.txt','tools.txt','index.json','context.txt','tools.txt','index.json')]
+        messages=self.snapshot_reads([1]*6,['same evidence']*6,paths)
+        self.answers=[json.dumps({'text':'ok','tool_calls':[]})]
+        self.assertEqual(self.post(messages=messages,tools=[TOOL]).status_code,200)
+        self.assertNotIn('LOOP GUARD',self.captured[-1]['query'])
+
+    def test_loop_guard_reminder_does_not_hide_new_human_message(self):
+        messages=self.snapshot_reads([1]*6,['same evidence']*6)
+        messages[-1]['content'].extend([
+            {'type':'text','text':'<system-reminder>Metadata only.</system-reminder>'},
+            {'type':'text','text':'New task: continue reading missing ranges.'}])
+        self.answers=[json.dumps({'text':'ok','tool_calls':[]})]
+        self.assertEqual(self.post(messages=messages,tools=[TOOL]).status_code,200)
+        self.assertNotIn('LOOP GUARD',self.captured[-1]['query'])
 
 if __name__=='__main__':unittest.main()

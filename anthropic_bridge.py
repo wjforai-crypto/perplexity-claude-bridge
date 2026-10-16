@@ -27,8 +27,11 @@ from context_transport import build_transport, INLINE_LIMIT
 from upload_guard import UploadRateLimitError
 from computer_backend import ask_computer, ComputerError
 
-VERSION = '1.2.2'
+VERSION = '1.2.5'
 MAX_QUERY_CHARS = 2_000_000
+LOOP_GUARD_THRESHOLD = 5
+LOOP_GUARD_NOTICE = '''LOOP GUARD: the last {n} consecutive tool turns read the same local context snapshot range and returned identical evidence. Re-reading that range is not making progress. Continue the pinned original/active request with the evidence already retrieved, or advance the task directly (read missing ranges, read the actual project files, or ask the user a direct question). Do not repeat the same snapshot range again this turn.
+'''
 MAX_TOTAL_BYTES = 100 * 1024 * 1024
 MAX_FILE_BYTES = 50 * 1024 * 1024
 MIME_EXT = {'image/png':'.png','image/jpeg':'.jpg','image/webp':'.webp',
@@ -223,6 +226,63 @@ def tool_spec(body):
     return specs,chosen
 
 
+def trailing_snapshot_reads(messages):
+    """Count trailing reads of the same snapshot range with identical evidence.
+
+    Tool results arrive as role=user messages, so a search streak alternates
+    assistant tool_use / user tool_result. Any real user text ends the streak.
+    """
+    count = 0
+    previous = None
+    results = {}
+    for m in reversed(messages or []):
+        content = m.content
+        blocks = content if isinstance(content, list) else []
+        if m.role == 'assistant':
+            calls = [b for b in blocks if isinstance(b, dict) and b.get('type') == 'tool_use']
+            if not calls:
+                return count
+            signatures = []
+            for call in calls:
+                args = call.get('input') or {}
+                if not isinstance(args, dict):
+                    return count
+                path = str(args.get('file_path', '')).replace('\\', '/')
+                if call.get('name') != 'Read' or '/context-cache/' not in '/' + path:
+                    return count
+                result = results.pop(call.get('id'), None)
+                if result is None:
+                    return count
+                # Snapshots get a new hash on each application turn. Identical
+                # range AND evidence may still repeat across those snapshots.
+                before, after = ('/' + path).split('/context-cache/', 1)
+                relative = after.split('/', 1)
+                if len(relative) != 2:
+                    return count
+                target = before + '/context-cache/<snapshot>/' + relative[1]
+                signatures.append(json.dumps([target,
+                    {**args, 'file_path': target, 'offset': args.get('offset', 1)},
+                    result], ensure_ascii=False, sort_keys=True))
+            signature = tuple(sorted(signatures))
+            if previous is not None and signature != previous:
+                return count
+            previous = signature
+            count += 1
+            continue
+        if m.role == 'user':
+            texts = [content] if isinstance(content, str) else [
+                b.get('text', '') for b in blocks if isinstance(b, dict) and b.get('type') == 'text']
+            if any(t.strip() and not t.lstrip().startswith('<system-reminder>') for t in texts):
+                return count
+            for block in blocks:
+                if isinstance(block, dict) and block.get('type') == 'tool_result':
+                    results[block.get('tool_use_id')] = {
+                        'content': block.get('content'), 'is_error': bool(block.get('is_error'))}
+            continue
+        return count
+    return count
+
+
 def build_query(body, material, computer_route=False):
     specs,choice=tool_spec(body)
     has_local_read=any(t['name']=='Read' for t in specs)
@@ -242,6 +302,12 @@ def build_query(body, material, computer_route=False):
     logging.info('Bridge context sizes: system=%s tools=%s messages=%s deferred=%s',len(payload['client_system_context']),len(json.dumps(specs)),len(json.dumps(messages)),sum(bool(t.get('defer_loading')) for t in body.tools or []))
     use_protocol=bool(specs)
     prefix=PROTOCOL if use_protocol else 'Answer the conversation below. Uploaded attachments are available with their named content. Do not claim local file access without tool results.\n'
+    streak=trailing_snapshot_reads(body.messages)
+    if use_protocol and streak>=LOOP_GUARD_THRESHOLD:
+        # Recovery loop observed live: the model re-reads its own search turns
+        # at the snapshot tail and never converges. Inject a hard correction.
+        logging.info('Bridge loop guard: %s consecutive snapshot reads; correction injected',streak)
+        prefix=LOOP_GUARD_NOTICE.format(n=streak)+prefix
     serialized=json.dumps(payload,ensure_ascii=False,separators=(',',':'))
     if len(serialized)>MAX_QUERY_CHARS:
         raise BridgeInputError(f'Request context exceeds {MAX_QUERY_CHARS:,} characters. Compact the conversation; no content has been silently truncated.')

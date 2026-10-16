@@ -16,6 +16,8 @@ installation.json
 *.db-*
 *.sqlite*
 backups/
+# Local handoff reports can contain machine paths and private incident details.
+docs/handoff/
 dist/
 build/
 *.egg-info/

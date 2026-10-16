@@ -2,6 +2,11 @@
 
 Each application turn is isolated. Reconnect only resumes the same task; an
 ambiguous submission is never automatically submitted a second time.
+
+Every turn creates one thread on the Perplexity web app. Once the turn is
+finished — answer returned, failed, cancelled, or timed out — only that
+self-created thread is queued for best-effort background cleanup via
+thread_janitor. Cleanup never affects the outcome of the request.
 """
 import json
 import logging
@@ -10,6 +15,7 @@ import time
 from uuid import uuid4
 
 from perplexity_web_mcp.rate_limits import _create_session
+from thread_janitor import schedule_thread_cleanup
 from upload_guard import force_fresh_upload
 
 BASE = 'https://www.perplexity.ai'
@@ -47,6 +53,7 @@ def ask_computer(query, model, token, uploader, files=(), cancel=None,
     session_factory = session_factory or _create_session
     deadline = time.monotonic() + timeout
     backend_id = None
+    rw_token = None
     reported_model = None
     reported_mode = None
     def check_cancel():
@@ -84,54 +91,64 @@ def ask_computer(query, model, token, uploader, files=(), cancel=None,
                 'supported_block_use_cases':['answer_modes','diff_blocks','inline_assets','canvas_mode','answer_tabs'],
                 'mentions':[],'dsl_query':query,'skip_search_enabled':True,'source':'default',
                 'should_ask_for_mcp_tool_confirmation':True,'force_enable_browser_agent':False,'version':'2.18'}
-        for attempt in range(6):
-            check_cancel()
-            if attempt and not backend_id:
-                raise ComputerError('Computer submission ended without a task ID; it was not resubmitted.', 'computer_submission_unknown')
-            url=ASK if attempt==0 else ASK+'/reconnect/'+backend_id
-            body={'params':params,'query_str':query} if attempt==0 else {'reconnectInitialSnapshot':True}
-            response=None
-            try:
-                response=session.post(url,json=body,headers={'Accept':'text/event-stream','Content-Type':'application/json',
-                    'x-perplexity-request-reason':'perplexity-query-state-provider' if attempt==0 else 'reconnect-stream',
-                    'x-request-id':str(uuid4())},stream=True,timeout=min(40,max(1,deadline-time.monotonic())))
-                if response.status_code != 200:
-                    status=response.status_code if response.status_code in (401,403,429) else 502
-                    raise ComputerError(f'Computer endpoint returned HTTP {response.status_code}.', 'computer_http_error', status)
-                for line in response.iter_lines():
-                    check_cancel()
-                    line=line.decode('utf8') if isinstance(line,bytes) else line
-                    if 'end_of_stream' in line:
-                        break
-                    if not line.startswith('data:'):
-                        continue
-                    try:data=json.loads(line[5:].strip())
-                    except ValueError:continue
-                    if not isinstance(data,dict):continue
-                    backend_id=data.get('backend_uuid') or backend_id
-                    reported_model=data.get('display_model') or reported_model
-                    reported_mode=data.get('mode') or reported_mode
-                    if reported_model and reported_model != model:
-                        raise ComputerError('Computer reported a different model. No fallback response was accepted.', 'computer_model_mismatch')
-                    if data.get('error') or data.get('error_code') or data.get('status') in ('FAILED','CANCELLED','CANCELED'):
-                        raise ComputerError('Computer task failed upstream.', 'computer_task_failed')
-                    if data.get('status')=='COMPLETED':
-                        if reported_mode!='ASI' or reported_model!=model:
-                            raise ComputerError('Computer did not confirm the requested ASI route.', 'computer_route_unconfirmed')
-                        answer=final_answer(data)
-                        if not answer.strip():
-                            raise ComputerError('Computer completed without a visible answer.', 'computer_empty_answer')
-                        logging.info('Computer complete: mode=%s model=%s reconnects=%s attachments=%s',reported_mode,reported_model,attempt,len(urls))
-                        return answer
-            except ComputerError:
-                raise
-            except Exception as exc:
-                # A known task may be reconnected, but never recreate a task
-                # when the submission outcome is ambiguous.
-                if not backend_id:
-                    raise ComputerError('Computer submission was interrupted before a task ID was received; no automatic resubmission.', 'computer_submission_unknown') from None
-                logging.warning('Computer stream interrupted: %s; resuming same task',type(exc).__name__)
-            finally:
-                if response is not None:response.close()
-            check_cancel()
-        raise ComputerError('Computer did not complete within the bounded reconnect attempts.', 'computer_timeout', 504)
+        try:
+            for attempt in range(6):
+                check_cancel()
+                if attempt and not backend_id:
+                    raise ComputerError('Computer submission ended without a task ID; it was not resubmitted.', 'computer_submission_unknown')
+                url=ASK if attempt==0 else ASK+'/reconnect/'+backend_id
+                body={'params':params,'query_str':query} if attempt==0 else {'reconnectInitialSnapshot':True}
+                response=None
+                try:
+                    response=session.post(url,json=body,headers={'Accept':'text/event-stream','Content-Type':'application/json',
+                        'x-perplexity-request-reason':'perplexity-query-state-provider' if attempt==0 else 'reconnect-stream',
+                        'x-request-id':str(uuid4())},stream=True,timeout=min(40,max(1,deadline-time.monotonic())))
+                    if response.status_code != 200:
+                        status=response.status_code if response.status_code in (401,403,429) else 502
+                        raise ComputerError(f'Computer endpoint returned HTTP {response.status_code}.', 'computer_http_error', status)
+                    for line in response.iter_lines():
+                        check_cancel()
+                        line=line.decode('utf8') if isinstance(line,bytes) else line
+                        if 'end_of_stream' in line:
+                            break
+                        if not line.startswith('data:'):
+                            continue
+                        try:data=json.loads(line[5:].strip())
+                        except ValueError:continue
+                        if not isinstance(data,dict):continue
+                        backend_id=data.get('backend_uuid') or backend_id
+                        rw_token=data.get('read_write_token') or rw_token
+                        reported_model=data.get('display_model') or reported_model
+                        reported_mode=data.get('mode') or reported_mode
+                        if reported_model and reported_model != model:
+                            raise ComputerError('Computer reported a different model. No fallback response was accepted.', 'computer_model_mismatch')
+                        if data.get('error') or data.get('error_code') or data.get('status') in ('FAILED','CANCELLED','CANCELED'):
+                            raise ComputerError('Computer task failed upstream.', 'computer_task_failed')
+                        if data.get('status')=='COMPLETED':
+                            if reported_mode!='ASI' or reported_model!=model:
+                                raise ComputerError('Computer did not confirm the requested ASI route.', 'computer_route_unconfirmed')
+                            answer=final_answer(data)
+                            if not answer.strip():
+                                raise ComputerError('Computer completed without a visible answer.', 'computer_empty_answer')
+                            logging.info('Computer complete: mode=%s model=%s reconnects=%s attachments=%s',reported_mode,reported_model,attempt,len(urls))
+                            return answer
+                except ComputerError:
+                    raise
+                except Exception as exc:
+                    # A known task may be reconnected, but never recreate a task
+                    # when the submission outcome is ambiguous.
+                    if not backend_id:
+                        raise ComputerError('Computer submission was interrupted before a task ID was received; no automatic resubmission.', 'computer_submission_unknown') from None
+                    logging.warning('Computer stream interrupted: %s; resuming same task',type(exc).__name__)
+                finally:
+                    if response is not None:response.close()
+                check_cancel()
+            raise ComputerError('Computer did not complete within the bounded reconnect attempts.', 'computer_timeout', 504)
+        finally:
+            # Enqueue only this turn's thread. The worker owns a fresh session;
+            # it never reuses this request's soon-to-be-closed session.
+            if backend_id:
+                try:
+                    schedule_thread_cleanup(token, backend_id, rw_token)
+                except Exception as exc:
+                    logging.warning('thread janitor: scheduling failed: %s', type(exc).__name__)

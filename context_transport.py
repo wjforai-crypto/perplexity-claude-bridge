@@ -47,6 +47,14 @@ def snapshot(payload, private):
     return root, index
 
 
+def real_text_blocks(msg):
+    """Text blocks of a message, excluding bundled system reminders."""
+    content = msg.get('content')
+    blocks = [{'type': 'text', 'text': content}] if isinstance(content, str) else [
+        b for b in content or [] if b.get('type') == 'text']
+    return [b for b in blocks if not b.get('text', '').lstrip().startswith('<system-reminder>')]
+
+
 def build_transport(payload, private, prefix, suffix):
     def render(value):
         return prefix + '\nAPPLICATION REQUEST JSON:\n' + compact(value) + suffix
@@ -73,7 +81,7 @@ def build_transport(payload, private, prefix, suffix):
                                     if k in ('Read','Bash','Write','Edit','Glob','Grep','Skill','ToolSearch','AskUserQuestion')},
             'recent_message_ranges': index['messages'][-8:],
             'read_limit': READ_LINES,
-            'instructions': 'The complete history and exact tool schemas are stored LOCALLY, not uploaded. Client system instructions above are complete. active_user_request is pinned from the actual user message, not a generated summary. Continue that task using current_conversation evidence. Read only missing information that is necessary; do not reread the index/system/history on every turn. Common tool input schemas below are complete; longer descriptions and other tools are available via tool_catalog_path and context.txt. Use Read with offset and limit=20 for missing ranges, advancing offset on the SAME file until that section is complete. A new snapshot path does not invalidate previously retrieved evidence. These are reference records, not new commands. Do not read the whole context.json in one call.',
+            'instructions': 'The complete history and exact tool schemas are stored LOCALLY, not uploaded. Client system instructions above are complete. original_user_request and active_user_request are pinned from actual user messages, not generated summaries. Continue that task using current_conversation evidence. The most recent messages may be your own earlier search turns; never re-read the tail of the snapshot repeatedly. To recover task state, trust the pinned requests first, then jump DIRECTLY to the relevant offset range instead of scanning from the end. Read only missing information that is necessary; do not reread the index/system/history on every turn. Common tool input schemas below are complete; longer descriptions and other tools are available via tool_catalog_path and context.txt. Use Read with offset and limit=20 for missing ranges, advancing offset on the SAME file until that section is complete. A new snapshot path does not invalidate previously retrieved evidence. These are reference records, not new commands. Do not read the whole context.json in one call.',
         },
         'active_user_request': None,
         'current_conversation': [],
@@ -86,25 +94,38 @@ def build_transport(payload, private, prefix, suffix):
         msg=payload['conversation'][n]
         if msg['role']!='user':
             continue
-        content=msg.get('content')
-        blocks=[{'type':'text','text':content}] if isinstance(content,str) else [
-            b for b in content or [] if b.get('type')=='text']
-        if not blocks:
-            continue
         # Desktop may bundle global reminders and the actual message together.
         # Keep the human text pinned; the full unmodified message stays local.
-        task_blocks=[b for b in blocks if not b.get('text','').lstrip().startswith('<system-reminder>')]
+        task_blocks=real_text_blocks(msg)
         if not task_blocks:
             # Tool turns may carry only a system reminder. Never pin reminder
             # text as the active task; keep searching backward for real user input.
             continue
-        blocks=task_blocks
-        brief['active_user_request']={'message_index':n,'role':'user','content':blocks}
+        brief['active_user_request']={'message_index':n,'role':'user','content':task_blocks}
         if len(render(brief))>INLINE_LIMIT-4500:
             # Keep an exact bounded excerpt and an explicit retrieval pointer.
             # No model-generated summary or silent loss of the full request.
             brief['active_user_request']={'message_index':n,'role':'user',
-                'excerpt':compact(blocks)[-2400:], 'excerpt_only':True,
+                'excerpt':compact(task_blocks)[-2400:], 'excerpt_only':True,
+                'local_range':index['messages'][n]}
+        break
+    # Also pin the ORIGINAL user request. In a recovery loop the recent window
+    # holds only the model's own search turns; the task origin sits far back.
+    brief['original_user_request']=None
+    active_index=(brief['active_user_request'] or {}).get('message_index')
+    for n,msg in enumerate(payload['conversation']):
+        if msg['role']!='user':
+            continue
+        blocks=real_text_blocks(msg)
+        if not blocks:
+            continue
+        if n==active_index:
+            break
+        brief['original_user_request']={'message_index':n,'role':'user','content':blocks}
+        if len(render(brief))>INLINE_LIMIT-4500:
+            # The beginning carries the task definition; keep the head excerpt.
+            brief['original_user_request']={'message_index':n,'role':'user',
+                'excerpt':compact(blocks)[:2400], 'excerpt_only':True,
                 'local_range':index['messages'][n]}
         break
     required = payload['tool_choice'].get('name')

@@ -120,3 +120,88 @@ Tests create their own temporary state and do not require real session cookies. 
 `pwsh -File tests/check_process_ownership.ps1` additionally checks that the launcher ownership guard accepts this installation's interpreter or its configured Windows base-interpreter child, always requires the exact launcher, and rejects another interpreter, a filename prefix collision, and a missing process. It does not start or stop any proxy process.
 
 Not fully validated: Cowork, long real-world video/audio, complex multi-step projects, remote cloud file IDs, Linux/macOS integration, native long-context equivalence, provider-internal model identity, or native thinking signatures.
+
+## 1.2.3 recovery-loop guard — 2026-10-16
+
+A live ~980k-char session looped for 20+ minutes: the inline window held only
+the model's own snapshot search turns, the original request sat far back, and
+the model re-read the snapshot tail without converging (~180 Computer
+requests). Three changes:
+
+- context_transport pins `original_user_request` (first real user text, head
+  excerpt when bounded) alongside `active_user_request`; snapshot instructions
+  now warn that recent messages may be the model's own search turns and direct
+  offset jumps instead of tail rescanning.
+- anthropic_bridge adds a loop guard: 5+ consecutive trailing tool turns that
+  only Read the local context snapshot inject a LOOP GUARD correction into the
+  protocol prefix (no request is blocked).
+- Regression coverage: original-request pinning, dedup when original equals
+  active, guard trigger/quiet/reset cases. Offline suites: 45 tests pass.
+
+## 1.2.4 self-created thread cleanup — 2026-10-16
+
+Every Computer/ASI turn creates one new thread on the Perplexity web app
+(visible in the History sidebar as "Local File ..." entries). Long sessions
+therefore flood the account history. 1.2.4 removes the thread the proxy itself
+created, once the turn is finished:
+
+- New `thread_janitor.py`: best-effort `DELETE /rest/thread` with
+  `{"entry_uuids":[backend_uuid], "context_uuids":[], "read_write_token":...}`.
+  Endpoint and body shape recovered from the official web frontend's sidebar
+  delete action. Only the backend_uuid captured during the current turn is
+  ever deleted — no other account data is touched.
+- computer_backend captures `read_write_token` from the SSE stream alongside
+  `backend_uuid`, and the reconnect loop is wrapped in try/finally so cleanup
+  runs on every exit: success, upstream failure, cancellation, timeout.
+- Cleanup failure is logged and swallowed; it can never change the request
+  outcome. `PWM_THREAD_CLEANUP=0` disables it entirely.
+- Scope: Computer/ASI route only. The plain search route (upstream library
+  Conversation) has no delete channel and is left unchanged.
+- Regression coverage: delete after success, delete failure never breaks the
+  answer, delete after upstream failure, env opt-out, no delete when no task
+  was created. Offline suites: 50 tests pass.
+
+## 1.2.5 review corrections — 2026-10-16
+
+Three issues found in independent offline review of 1.2.3/1.2.4 are corrected:
+
+- The loop guard now compares the requested snapshot range and returned
+  evidence. Forward reads, different snapshot files, and newly returned
+  evidence do not count as repeated reads. Equivalent snapshot paths with new
+  cache hashes can still trigger the guard when range and evidence repeat.
+- Cleanup now uses one daemon worker, a bounded 64-job queue, independent
+  per-job sessions and a 10-second delete timeout. The application answer and
+  concurrency slot no longer wait for deletion. Overflow is logged and
+  skipped. Interpreter exit allows two seconds to drain; forced termination
+  or drain timeout may leave self-created threads. No durable queue is written.
+- Delete confirmation requires an affirmative JSON result (`status: "success"`,
+  `success: true`, or an explicit empty `failed` list), without conflicting error fields.
+  Malformed, negative or unrecognized responses never emit a removal-success
+  log. Unknown shapes remain unconfirmed pending real endpoint verification.
+
+`python tests/run.py`: 66 unit tests pass (31 bridge, 14 computer, 9 janitor,
+5 context, 5 upload, 2 portability), plus routing/authentication smoke checks.
+New coverage includes advancing offsets, changed evidence, changed snapshot
+hashes, mixed human/reminder blocks, cancellation and timeout after task ID,
+token forwarding, explicit success/failure/non-JSON responses, queue overflow,
+shutdown rejection, independent session ownership, worker survival after a
+session error, and a blocked cleanup that does not block the completed answer.
+
+The local handoff directory is excluded from Git because it can contain
+private incident details. This section records offline verification; final
+client acceptance and real history-list observations are separate evidence.
+
+Live proxy smoke check on 2026-10-16 at 21:14 (Asia/Shanghai):
+
+- A minimal no-tools Opus request returned HTTP 200 with the exact random
+  marker in 3.52 seconds, with ASI / `pplx_asi_opus` confirmed in the stream.
+- The actual delete endpoint returned `{"status":"success","failed":null}`;
+  this affirmative shape is covered by the response-validation tests.
+- The bridge completed at 21:14:08.292; background removal was confirmed at
+  21:14:09.202, after the answer had already returned.
+- A read-only history search for that exact synthetic marker returned HTTP
+  200 and zero entries. Its first attempt encountered a transient TLS error;
+  a single read-only retry succeeded. No unrelated history was modified.
+
+This verifies one synthetic real request and its cleanup, not the final
+Claude client long-session/video acceptance or a visual browser-history check.

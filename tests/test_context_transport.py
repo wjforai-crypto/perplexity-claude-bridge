@@ -54,5 +54,34 @@ class ContextTransportTests(unittest.TestCase):
             brief=json.JSONDecoder().raw_decode(q.split('APPLICATION REQUEST JSON:\n')[1])[0]
             self.assertEqual(brief['active_user_request']['message_index'],0)
             self.assertNotIn('Tool output reminder only',json.dumps(brief['active_user_request'],ensure_ascii=False))
+    def test_original_request_pinned_alongside_active_task(self):
+        tool={'name':'Read','description':'Read a local file.','input_schema':{'type':'object','properties':{'file_path':{'type':'string'}},'required':['file_path']}}
+        conversation=[{'role':'user','content':'ORIGINAL_TASK_552: rebuild the landing page hero section.'}]
+        for i in range(12):
+            conversation.extend([
+                {'role':'assistant','content':[{'type':'tool_use','id':str(i),'name':'Read','input':{'file_path':'fixture.txt'}}]},
+                {'role':'user','content':[{'type':'tool_result','tool_use_id':str(i),'content':'evidence '*900}]}
+            ])
+        conversation.append({'role':'user','content':'ACTIVE_CONTINUE_553: carry on.'})
+        payload={'active_proxy_model':'claude-opus-5-5','client_system_context':'Rules','registered_tools':[tool],
+                 'tool_choice':{'type':'auto'},'conversation':conversation}
+        with tempfile.TemporaryDirectory() as temp:
+            q=build_transport(payload,Path(temp),'Transport contract','')
+            self.assertLessEqual(len(q),28000)
+            self.assertIn('ORIGINAL_TASK_552',q)
+            self.assertIn('ACTIVE_CONTINUE_553',q)
+            brief=json.JSONDecoder().raw_decode(q.split('APPLICATION REQUEST JSON:\n')[1])[0]
+            self.assertEqual(brief['original_user_request']['message_index'],0)
+            self.assertEqual(brief['active_user_request']['message_index'],len(conversation)-1)
+    def test_original_request_not_duplicated_when_same_as_active(self):
+        tool={'name':'Read','description':'Read a local file.','input_schema':{'type':'object','properties':{'file_path':{'type':'string'}},'required':['file_path']}}
+        conversation=[{'role':'user','content':'ONLY_TASK_554: describe this sheet. '+('detail '*4000)}]
+        payload={'active_proxy_model':'claude-opus-5-5','client_system_context':'Rules','registered_tools':[tool],
+                 'tool_choice':{'type':'auto'},'conversation':conversation}
+        with tempfile.TemporaryDirectory() as temp:
+            q=build_transport(payload,Path(temp),'Transport contract','')
+            brief=json.JSONDecoder().raw_decode(q.split('APPLICATION REQUEST JSON:\n')[1])[0]
+            self.assertIsNone(brief.get('original_user_request'))
+            self.assertEqual(brief['active_user_request']['message_index'],0)
 
 if __name__=='__main__':unittest.main()
