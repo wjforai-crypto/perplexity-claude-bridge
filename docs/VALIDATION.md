@@ -1,5 +1,79 @@
 # Validation scope
 
+## Computer-route task retention and image repair — 2026-10-16
+
+Version 1.2.1 fixes two production defects found after 1.2.0:
+
+1. Long tool conversations could pin a `<system-reminder>`-only tool turn as the
+   active user request, dropping the real task from the inline prompt. The
+   pinner now skips reminder-only turns and keeps searching backward for real
+   user text, with a dedicated regression test.
+2. Live layered probes proved the ASI/Computer backend never exposes attachment
+   bytes to the model during tool turns (HTTP 200, yet the model only sees an
+   attachment record; the reference VSCode-Perplexity-MCP client also sends
+   `attachments: []` in Computer mode). The bridge therefore no longer uploads
+   invisible attachments on the Computer route when tools are registered, and
+   the protocol directs image inspection to the local helper.
+
+Verification on 2026-10-16 (Asia/Shanghai): all 39 offline checks pass (23
+bridge, 7 computer, 3 context, 4 upload, 2 portability) plus the process
+ownership script. The reminder-pinning probe now pins message 0 with the real
+task text inline. Live checks against the running proxy: a no-tools image turn
+correctly described a probe image (text, colors, layout); the previous failing
+tool-turn image shape now drives the model to the local helper, whose real
+analysis it relayed (end-to-end Read → tool_result → helper → answer). The
+running directory's start/stop scripts now enforce the strict installation
+ownership guard. Remaining gaps: full desktop multi-turn video production,
+real long-video/audio, Cowork, and live cancellation/quota-stop behavior.
+
+## Desktop image and task-continuity repair — 2026-10-16
+
+Version 1.1.1 fixes a real Desktop request shape: a system token-metadata message
+can follow an image-bearing Read result. The latest non-system message is now
+selected for fresh attachment upload. Bounded prompts pin the latest actual user
+text across tool rounds, keep common tool schemas inline, and move the complete
+tool catalog into an indexed local file. Full original context remains preserved.
+The local raw-context limit is 2,000,000 characters so an existing conversation
+polluted by the old read loop can recover; the upstream inline budget remains
+28,000 characters.
+
+All 30 offline tests pass (22 bridge, 2 context, 4 upload, 2 portability), plus
+routing/authentication checks. The fresh-image and lost-task regressions failed
+before the changes and passed afterward. A real image-bearing Read result with
+trailing system metadata returned HTTP 200 and described the image's actual text,
+colors, grid layout and timestamps. This is transport/image evidence, not proof
+of provider-internal model identity or completion of a full desktop video task.
+
+Separate Computer-mode probes succeeded with upstream mode ASI and the advertised
+Computer model route: one fixed-marker response and one valid local Read request
+envelope. As of 1.2.0 the Opus mapping routes through this Computer backend in
+production; the 1.2.1 section above records its live task-retention and image
+behavior. Full desktop acceptance remains unverified.
+
+## Upload-limit repair — 2026-10-16
+
+The upstream upload endpoint returned HTTP 200 with `rate_limited: true` and no
+upload URL, even for a 60-byte text fixture. The previous SDK reduced that to
+`FileUploadError`; the bridge returned a generic 502. Automatically uploading
+full context and every historical image made unrelated text turns fail too.
+
+The repair retains indexed full context and historical binary attachments locally,
+limits the prompt body to 28,000 characters, preserves complete system instructions,
+and reports upload quotas explicitly. A native Read call is required before the
+model can inspect an archived image again. Quotas are neither reset nor bypassed.
+
+`python tests/run.py` now runs 27 unit tests (20 bridge, 1 context-budget,
+4 upload-guard, 2 portability) plus the isolated routing/authentication checks.
+Coverage includes the captured rate-limit response shape, account-scoped cache
+expiry, preserving full local history, a 110-tool catalog, complete system
+instructions, and historical versus current-turn image behavior.
+
+Live synthetic transport checks showed missing markers in 44,228- and
+560,228-character prompts, while all five markers survived 28,228 characters.
+A repaired long-context request returned the expected marker via HTTP 200.
+These observations motivate a conservative budget; they do not guarantee a
+provider-wide fixed limit or that all historical detail is simultaneously visible.
+
 ## Original local deployment — 2026-10-16
 
 Windows, upstream 0.16.1 at revision `e34b5082d6c16283358d8a1e3cbd7fa61c35fc0d`, CC Switch 3.19.2, Claude Code 2.1.229 and Claude Desktop 2.31226.1.0.

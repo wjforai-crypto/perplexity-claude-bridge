@@ -33,8 +33,8 @@ with patch.object(s.ServerConfig,'from_env',return_value=settings),patch.object(
             assert r.status_code==400,(wrong,r.text)
         r=client.post('/v1/messages',json={'model':'claude-opus-5-5','max_tokens':20,'messages':[{'role':'user','content':'test'}]})
         assert r.status_code in (401,403),r.text
-        assert s.get_model('claude-opus-5-5').identifier=='claude55opus'
-        assert s.get_model('claude-opus-5-5',True).identifier=='claude55opusthinking'
+        assert s.get_model('claude-opus-5-5').identifier=='pplx_asi_opus'
+        assert s.get_model('claude-opus-5-5',True).identifier=='pplx_asi_opus'
         assert s.get_model('claude-sonnet-5-5').identifier=='claude55sonnet'
         assert s.get_model('claude-sonnet-5-5',True).identifier=='claude55sonnetthinking'
 print(json.dumps({'offline_checks':'passed','upstream_calls':0,'checks':['health','authentication','two_model_catalog','reject_unknown_and_mock_models','exact_opus55_and_sonnet55_mapping']}))

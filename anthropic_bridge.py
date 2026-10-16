@@ -17,14 +17,18 @@ import sys
 from pathlib import Path
 import tempfile
 import time
+import threading
 import uuid
 
 from fastapi import HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from jsonschema import Draft202012Validator, ValidationError, SchemaError
+from context_transport import build_transport, INLINE_LIMIT
+from upload_guard import UploadRateLimitError
+from computer_backend import ask_computer, ComputerError
 
-VERSION = '1.0.0'
-MAX_QUERY_CHARS = 600_000
+VERSION = '1.2.1'
+MAX_QUERY_CHARS = 2_000_000
 MAX_TOTAL_BYTES = 100 * 1024 * 1024
 MAX_FILE_BYTES = 50 * 1024 * 1024
 MIME_EXT = {'image/png':'.png','image/jpeg':'.jpg','image/webp':'.webp',
@@ -44,9 +48,21 @@ to run this installed helper using the actual user-provided file path:
 __LOCAL_HELPER_COMMAND__ --file "ABSOLUTE_PATH" --prompt "THE_ANALYSIS_QUESTION" --model "ACTIVE_PROXY_MODEL"
 Replace ACTIVE_PROXY_MODEL with active_proxy_model in the application request.
 This helper uploads that selected file to Perplexity and returns its real analysis;
-it is not a fabricated observation. Use Read for ordinary text/images. If a video
+it is not a fabricated observation. Use Read for ordinary text. On this route an image Read result is not visible to you; inspect images with the local helper instead. If a video
 exceeds the helper's 50 MiB limit, use Bash ffprobe/ffmpeg to extract representative
 frames and Read those frames; report sampled coverage, with audio not analyzed.
+An upload can be rate limited even below 50 MiB. On file_upload_rate_limited,
+stop retrying the whole file. Use the local text or extracted image frames when
+available; state that the original video/audio was not uploaded or analyzed.
+Historical binary attachments may be retained as local_attachment_reference
+records marked not_uploaded_in_this_request. Their bytes are not visible to you
+now. Use the native Read tool to inspect an image again only when needed; never
+claim to see the historical file from its reference alone.
+uploaded_attachment records were uploaded with this request, but on this
+Computer route their bytes are NOT visible to you during tool turns. Never
+claim to see an uploaded image from its record alone. To inspect an image file,
+request Bash to run the local helper command shown above with --file ABSOLUTE_PATH
+and a short --prompt; the helper returns the real visual analysis.
 
 Transport response format: return ONLY one JSON object, without Markdown:
 {"text":"short user-facing response, or empty","tool_calls":[]}
@@ -77,6 +93,7 @@ class BridgeProtocolError(ValueError):
 class Materialized:
     """Request-scoped attachment files; recursively preserves tool return blocks."""
     def __init__(self, private: Path):
+        self.private = private
         temp_root = private / 'bridge-temp'
         temp_root.mkdir(exist_ok=True)
         self.temp = tempfile.TemporaryDirectory(prefix='request-',dir=temp_root)
@@ -88,7 +105,7 @@ class Materialized:
     def close(self):
         self.temp.cleanup()
 
-    def content(self, value):
+    def content(self, value, upload=True):
         if isinstance(value,str):
             return value
         if not isinstance(value,list):
@@ -106,9 +123,9 @@ class Materialized:
             elif kind=='tool_result':
                 result.append({'type':kind,'tool_use_id':block.get('tool_use_id'),
                                'is_error':bool(block.get('is_error',False)),
-                               'content':self.content(block.get('content',''))})
+                               'content':self.content(block.get('content',''),upload=upload)})
             elif kind in ('image','document','video','audio','file'):
-                result.append(self.attachment(block))
+                result.append(self.attachment(block,upload=upload))
             elif kind in ('thinking','redacted_thinking'):
                 # Not portable signed Anthropic reasoning. Do not send to another provider.
                 continue
@@ -118,7 +135,7 @@ class Materialized:
                 raise BridgeInputError(f'Unsupported content block: {kind!r}; it was not silently discarded.')
         return result
 
-    def attachment(self, block):
+    def attachment(self, block, upload=True):
         source=block.get('source') or {}
         kind=source.get('type')
         mime=source.get('media_type','')
@@ -126,7 +143,7 @@ class Materialized:
         if kind=='text':
             return {'type':'document','title':title,'text':source.get('data','')}
         if kind=='content':
-            return {'type':'document','title':title,'content':self.content(source.get('content',[]))}
+            return {'type':'document','title':title,'content':self.content(source.get('content',[]),upload=upload)}
         if kind!='base64':
             raise BridgeInputError('Attachments must contain base64 bytes or text. Remote URLs/file IDs are not uploaded by this adapter; supply the actual file content.')
         data=source.get('data','')
@@ -150,6 +167,14 @@ class Materialized:
         if mime not in MIME_EXT:
             raise BridgeInputError(f'Unsupported attachment MIME type: {mime!r}. Convert documents to UTF-8 text/PDF and videos to MP4 or sampled images.')
         digest=hashlib.sha256(raw).hexdigest()
+        if not upload:
+            cache=self.private/'attachment-cache'
+            cache.mkdir(exist_ok=True)
+            path=cache/(digest+MIME_EXT[mime])
+            if not path.exists():path.write_bytes(raw)
+            return {'type':'local_attachment_reference','file_path':path.as_posix(),
+                    'media_type':mime,'title':title,'status':'not_uploaded_in_this_request',
+                    'instructions':'Historical bytes are retained locally; use Read for images or the local helper for other files only if needed. Do not claim the current model has seen this file.'}
         key=mime+':'+digest
         if key not in self.by_hash:
             if len(self.files)>=30:
@@ -198,9 +223,18 @@ def tool_spec(body):
     return specs,chosen
 
 
-def build_query(body, material):
+def build_query(body, material, computer_route=False):
     specs,choice=tool_spec(body)
-    messages=[{'role':m.role,'content':material.content(m.content)} for m in body.messages]
+    has_local_read=any(t['name']=='Read' for t in specs)
+    # Desktop adds token/system metadata after Read results. It must not make a
+    # just-read image look historical: select the latest actual client message.
+    current_index=next((i for i in range(len(body.messages)-1,-1,-1)
+                        if body.messages[i].role!='system'),-1)
+    # The Computer route never exposes attachment bytes to the model during tool turns
+    # (verified against the live ASI backend), so uploading there only wastes quota
+    # and risks upload rate limits. Keep bytes as local references for the helper.
+    allow_upload=(not computer_route) or not specs
+    messages=[{'role':m.role,'content':material.content(m.content,upload=allow_upload and (not has_local_read or i==current_index))} for i,m in enumerate(body.messages)]
     if not messages:
         raise BridgeInputError('messages is required.')
     payload={'active_proxy_model':body.model,'conversation':messages,'tool_choice':choice,'registered_tools':specs,
@@ -210,40 +244,13 @@ def build_query(body, material):
     prefix=PROTOCOL if use_protocol else 'Answer the conversation below. Uploaded attachments are available with their named content. Do not claim local file access without tool results.\n'
     serialized=json.dumps(payload,ensure_ascii=False,separators=(',',':'))
     if len(serialized)>MAX_QUERY_CHARS:
-        raise BridgeInputError('Request context exceeds 600,000 characters. Compact the conversation; no content has been silently truncated.')
-    # Perplexity's web prompt can be clipped before it reaches the model. Keep
-    # the complete request in a native text attachment and a working subset in
-    # the query. Nothing is silently thrown away; schemas remain authoritative
-    # for local validation even when their long documentation is in the file.
-    if len(serialized)>45000:
-        if len(material.files)>=30:
-            raise BridgeInputError('Large contexts need one attachment slot; use at most 29 user attachments.')
-        path=Path(material.temp.name)/'application-context.txt'
-        path.write_text(serialized,encoding='utf-8')
-        material.files.append(str(path))
-        recent=[];size=0
-        for msg in reversed(messages):
-            encoded=json.dumps(msg,ensure_ascii=False,separators=(',',':'))
-            if len(encoded)+size>14000:
-                if not recent:
-                    recent=[{'role':msg['role'],'content':'Latest full message is in application-context.txt; consult it before acting.'}]
-                break
-            recent.insert(0,msg);size+=len(encoded)
-        core={'Read','Write','Edit','Bash','Glob','Grep','Skill','ToolSearch','AskUserQuestion'}
-        if choice.get('name'):core.add(choice['name'])
-        inline=[{'name':t['name'],'description':t['description'][:240],'input_schema':t['input_schema']} for t in specs if t['name'] in core]
-        system=payload['client_system_context']
-        brief={'active_proxy_model':body.model,'current_conversation':recent,'tool_choice':choice,'common_tools':inline,
-               'all_registered_tool_names':[t['name'] for t in specs],
-               'client_system_context':system if len(system)<=18000 else 'Complete client system instructions are in application-context.txt. Read those instructions before responding.'}
-        prefix+='\nThe attached application-context.txt contains the COMPLETE client instructions, full conversation, and exact tool schemas/descriptions. Consult it for missing details. The inline context below is only a working subset, not a replacement for client instructions.\n'
-        serialized=json.dumps(brief,ensure_ascii=False,separators=(',',':'))
-        logging.info('Bridge context attached: full_chars=%s inline_chars=%s',len(path.read_text(encoding='utf-8')),len(serialized))
-    query=prefix+'\nAPPLICATION REQUEST JSON:\n'+serialized
-    if use_protocol:
-        query+='\nEND APPLICATION REQUEST. Return only the JSON transport object described above.'
-    if len(query)>MAX_QUERY_CHARS:
-        raise BridgeInputError('Request context exceeds 600,000 characters. Compact the conversation or use smaller file excerpts; no content has been silently truncated.')
+        raise BridgeInputError(f'Request context exceeds {MAX_QUERY_CHARS:,} characters. Compact the conversation; no content has been silently truncated.')
+    suffix='\nEND APPLICATION REQUEST. Return only the JSON transport object described above.' if use_protocol else ''
+    try:
+        query=build_transport(payload,material.private,prefix,suffix)
+    except ValueError as ex:
+        raise BridgeInputError(str(ex)) from None
+    logging.info('Bridge context transport: full_chars=%s inline_chars=%s local_snapshot=%s',len(serialized),len(query),'"local_context":' in query)
     return query,specs,choice
 
 
@@ -305,6 +312,7 @@ def install(server, private: Path):
 
     async def process(body,material,query,specs,choice,message_id):
         model=server.get_model(body.model,thinking=bool(body.thinking and body.thinking.get('type') in ('enabled','adaptive')))
+        cancel=threading.Event()
         def upstream():
             fresh=server.Perplexity(session_token=server.config.session_token)
             try:
@@ -314,20 +322,27 @@ def install(server, private: Path):
                     if wait:time.sleep(wait)
                     try:
                         conversation=fresh.create_conversation(server.ConversationConfig(model=model))
-                        conversation.ask(prompt,files=material.files or None,init_query='Local application conversation')
-                        raw=conversation.answer or ''
+                        if model.identifier.startswith('pplx_asi_'):
+                            raw=ask_computer(prompt,model.identifier,server.config.session_token,conversation,material.files,cancel)
+                        else:
+                            conversation.ask(prompt,files=material.files or None,init_query='Local application conversation')
+                            raw=conversation.answer or ''
                     finally:server.last_request_time=time.time()
                     try:return parse_response(raw,specs,choice)
                     except BridgeProtocolError:
                         if attempt:raise
                         logging.info('Bridge: retrying response format once; no client action emitted')
-                        prompt=query+'\nFORMAT CORRECTION: Your previous output was rejected. Return exactly the required JSON envelope with at most one registered tool and schema-valid arguments. Do not execute anything yourself.\nREJECTED OUTPUT:\n'+raw[:16000]
+                        correction='FORMAT CORRECTION: Return only the JSON envelope with at most one registered tool and schema-valid arguments. Do not execute anything yourself.\n'
+                        prompt=correction+query
+                        if len(prompt)>INLINE_LIMIT:
+                            raise BridgeProtocolError('Response format rejected and prompt cannot safely fit a repair request.')
             finally:fresh.close()
         try:
             async with server.perplexity_semaphore:
                 task=asyncio.create_task(asyncio.to_thread(upstream))
                 try:blocks,stop=await asyncio.shield(task)
                 except asyncio.CancelledError:
+                    cancel.set()
                     # Keep uploads and the concurrency slot alive until the worker stops.
                     try:await asyncio.shield(task)
                     except Exception:pass
@@ -343,7 +358,9 @@ def install(server, private: Path):
         server.verify_auth(request)
         server.get_model(body.model)
         material=Materialized(private)
-        try:query,specs,choice=build_query(body,material)
+        try:
+            computer_route=server.get_model(body.model).identifier.startswith('pplx_asi_')
+            query,specs,choice=build_query(body,material,computer_route=computer_route)
         except BridgeInputError as ex:
             material.close()
             return JSONResponse({'type':'error','error':{'type':'invalid_request_error','message':str(ex)}},status_code=400)
@@ -353,6 +370,12 @@ def install(server, private: Path):
         logging.info('Bridge request: id=%s model=%s tools=%s attachments=%s blocks=%s chars=%s',message_id,body.model,len(specs),len(material.files),material.block_types,len(query))
         if not body.stream:
             try:return JSONResponse(await process(body,material,query,specs,choice,message_id))
+            except UploadRateLimitError:
+                logging.warning('Bridge upload rate limited: request=%s',message_id)
+                return JSONResponse({'type':'error','error':{'type':'rate_limit_error','code':'file_upload_rate_limited','message':'Perplexity file uploads are currently rate limited; the service did not provide a reset time. Stop repeated file uploads. Text chat and local sampled-image workflows can continue when available.'}},status_code=429,headers={'Retry-After':str(UploadRateLimitError.retry_after)})
+            except ComputerError as ex:
+                logging.warning('Computer request failed: request=%s code=%s',message_id,ex.code)
+                return JSONResponse({'type':'error','error':{'type':'rate_limit_error' if ex.status==429 else 'api_error','code':ex.code,'message':str(ex)}},status_code=ex.status)
             except Exception as ex:
                 logging.warning('Bridge request failed: %s',type(ex).__name__)
                 return JSONResponse({'type':'error','error':{'type':'api_error','message':f'Perplexity bridge failed ({type(ex).__name__}); no successful tool action is implied.'}},status_code=502)
@@ -368,6 +391,12 @@ def install(server, private: Path):
             except asyncio.CancelledError:
                 task.cancel()
                 raise
+            except UploadRateLimitError:
+                logging.warning('Bridge upload rate limited: request=%s',message_id)
+                yield event('error',error={'type':'rate_limit_error','code':'file_upload_rate_limited','message':'Perplexity file uploads are currently rate limited. Stop repeated uploads; the reset time is unknown. Use local text or sampled images when available.'})
+            except ComputerError as ex:
+                logging.warning('Computer stream failed: request=%s code=%s',message_id,ex.code)
+                yield event('error',error={'type':'rate_limit_error' if ex.status==429 else 'api_error','code':ex.code,'message':str(ex)})
             except Exception as ex:
                 logging.warning('Bridge stream failed: %s',type(ex).__name__)
                 yield event('error',error={'type':'api_error','message':f'Perplexity bridge failed ({type(ex).__name__}). No fabricated answer/tool result was emitted.'})

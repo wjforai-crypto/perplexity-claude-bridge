@@ -11,10 +11,12 @@ os.environ['PYTHONIOENCODING'] = 'utf-8'
 from perplexity_web_mcp import token_store
 token_store.CONFIG_DIR = PRIVATE
 token_store.TOKEN_FILE = PRIVATE / 'session.token'
-MODEL_IDS = {'claude-opus-5-5': ('claude55opus','claude55opusthinking'),
+MODEL_IDS = {'claude-opus-5-5': ('pplx_asi_opus','pplx_asi_opus'),
              'claude-sonnet-5-5': ('claude55sonnet','claude55sonnetthinking')}
 
 def configure_api():
+    from upload_guard import install_upload_guard
+    install_upload_guard()
     os.environ['PWM_API_KEY'] = (PRIVATE / 'api-key.txt').read_text(encoding='utf-8').strip()
     if not os.environ['PWM_API_KEY']:
         raise RuntimeError('Local API key is empty. Run initialize.py before starting the proxy.')
@@ -38,7 +40,7 @@ def configure_api():
             raise HTTPException(status_code=400, detail='Use claude-opus-5-5 or claude-sonnet-5-5; automatic fallback is disabled.')
         return Model(identifier=MODEL_IDS[name][1 if thinking else 0])
     server.get_model = strict_model
-    server.AVAILABLE_MODELS = [{'id':m,'description':m} for m in MODEL_IDS]
+    server.AVAILABLE_MODELS = [{'id':m,'description':m+(' via Perplexity Computer' if 'opus' in m else ' via Perplexity Search')} for m in MODEL_IDS]
     from anthropic_bridge import install
     install(server, PRIVATE)
     @server.app.middleware('http')
