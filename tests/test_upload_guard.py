@@ -55,5 +55,21 @@ class UploadGuardTests(unittest.TestCase):
         for _ in range(2):
             with self.assertRaises(RuntimeError):guard.cached_upload(self.conv,self.info,upload)
         self.assertEqual(upload.call_count,2)
+    def test_forced_fresh_upload_bypasses_url_cache(self):
+        # The ASI backend does not re-bind a previously used upload URL to a new
+        # task; reusing one yields an attachment record without content. Callers
+        # on that route force fresh uploads via the thread-local scope because
+        # Conversation instances use __slots__.
+        upload=Mock(return_value='fresh-url')
+        guard.cached_upload(self.conv,self.info,upload)
+        with guard.force_fresh_upload():
+            guard.cached_upload(self.conv,self.info,upload)
+        self.assertEqual(upload.call_count,2)
+        with guard.force_fresh_upload():
+            self.assertEqual(guard.cached_upload(self.conv,self.info,upload),'fresh-url')
+        self.assertEqual(upload.call_count,3)
+        # Scope exit restores caching.
+        guard.cached_upload(self.conv,self.info,upload)
+        self.assertEqual(upload.call_count,3)
 
 if __name__=='__main__':unittest.main()

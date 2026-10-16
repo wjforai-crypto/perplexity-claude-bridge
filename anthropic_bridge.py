@@ -27,7 +27,7 @@ from context_transport import build_transport, INLINE_LIMIT
 from upload_guard import UploadRateLimitError
 from computer_backend import ask_computer, ComputerError
 
-VERSION = '1.2.1'
+VERSION = '1.2.2'
 MAX_QUERY_CHARS = 2_000_000
 MAX_TOTAL_BYTES = 100 * 1024 * 1024
 MAX_FILE_BYTES = 50 * 1024 * 1024

@@ -19,6 +19,23 @@ COOLDOWN = 60
 _cache = OrderedDict()
 _blocked = {}
 _lock = threading.RLock()
+_fresh_upload = threading.local()
+
+
+def force_fresh_upload():
+    """Bypass the upload-URL cache within the block.
+
+    The ASI backend does not re-bind a previously used upload URL to a new
+    task; Conversation uses __slots__, so the flag lives in a thread-local
+    instead of an instance attribute.
+    """
+    class _Scope:
+        def __enter__(self):
+            self.previous = getattr(_fresh_upload, 'enabled', False)
+            _fresh_upload.enabled = True
+        def __exit__(self, *exc):
+            _fresh_upload.enabled = self.previous
+    return _Scope()
 
 
 class UploadRateLimitError(FileUploadError):
@@ -60,9 +77,10 @@ def cached_upload(conversation, info, upload):
     account = account_key(conversation._http)
     key = (account, info.mimetype, Path(info.path).name, hashlib.sha256(Path(info.path).read_bytes()).digest())
     now = time.monotonic()
+    fresh = getattr(_fresh_upload, 'enabled', False)
     with _lock:
         cached = _cache.get(key)
-        if cached and cached[0] > now:
+        if cached and cached[0] > now and not fresh:
             _cache.move_to_end(key)
             return cached[1]
         if cached:

@@ -10,6 +10,7 @@ import time
 from uuid import uuid4
 
 from perplexity_web_mcp.rate_limits import _create_session
+from upload_guard import force_fresh_upload
 
 BASE = 'https://www.perplexity.ai'
 ASK = BASE + '/rest/sse/perplexity_ask'
@@ -66,9 +67,14 @@ def ask_computer(query, model, token, uploader, files=(), cancel=None,
             raise ComputerError('This account does not currently have Computer access.', 'computer_access_denied', 403)
         urls=[]
         if files:
-            for info in uploader._validate_files(list(files)):
-                check_cancel()
-                urls.append(uploader._upload_file(info))
+            # Live probing shows the ASI backend does not re-bind a previously
+            # used upload URL to a new task: reuse yields an attachment record
+            # without content. Always upload fresh; the rate-limit cooldown
+            # in upload_guard still applies.
+            with force_fresh_upload():
+                for info in uploader._validate_files(list(files)):
+                    check_cancel()
+                    urls.append(uploader._upload_file(info))
         params={'attachments':urls,'language':'zh-CN','timezone':'Asia/Shanghai',
                 'search_focus':'internet','sources':['web'],'frontend_uuid':str(uuid4()),
                 'frontend_context_uuid':str(uuid4()),'mode':'copilot','model_preference':model,

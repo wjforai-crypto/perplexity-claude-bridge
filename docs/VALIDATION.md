@@ -1,5 +1,22 @@
 # Validation scope
 
+## Correction: attachment root cause and 1.2.2 — 2026-10-16
+
+The 1.2.1 section below identifies two attachment defects; both are now
+confirmed with confound separated:
+
+1. The ASI backend never exposes attachment bytes to the model **during tool
+   turns**, even with a freshly uploaded URL (HTTP 200, model sees only an
+   attachment record). Tool-turn images therefore stay as local references and
+   the protocol routes image inspection to the local helper. This 1.2.1
+   behavior is correct and remains in 1.2.2.
+2. The backend also **does not re-bind a previously used upload URL** to a new
+   task, so the helper's no-tools nested call was failing whenever it reused a
+   cached URL (16:21–16:22 helper failures). Version 1.2.2 fixes this:
+   `force_fresh_upload()` (thread-local; `Conversation` uses `__slots__`)
+   makes the Computer route upload fresh URLs per task while the rate-limit
+   cooldown still applies.
+
 ## Computer-route task retention and image repair — 2026-10-16
 
 Version 1.2.1 fixes two production defects found after 1.2.0:
@@ -7,13 +24,11 @@ Version 1.2.1 fixes two production defects found after 1.2.0:
 1. Long tool conversations could pin a `<system-reminder>`-only tool turn as the
    active user request, dropping the real task from the inline prompt. The
    pinner now skips reminder-only turns and keeps searching backward for real
-   user text, with a dedicated regression test.
-2. Live layered probes proved the ASI/Computer backend never exposes attachment
-   bytes to the model during tool turns (HTTP 200, yet the model only sees an
-   attachment record; the reference VSCode-Perplexity-MCP client also sends
-   `attachments: []` in Computer mode). The bridge therefore no longer uploads
-   invisible attachments on the Computer route when tools are registered, and
-   the protocol directs image inspection to the local helper.
+   user text, with a dedicated regression test. (This fix is correct and
+   remains in 1.2.2.)
+2. ~~Live layered probes proved the ASI/Computer backend never exposes attachment
+   bytes to the model during tool turns~~ — superseded by the correction above;
+   the invisible-attachment cause was cached upload URL reuse, not tool turns.
 
 Verification on 2026-10-16 (Asia/Shanghai): all 39 offline checks pass (23
 bridge, 7 computer, 3 context, 4 upload, 2 portability) plus the process
