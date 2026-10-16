@@ -28,6 +28,6 @@ The public copy removes machine-specific paths, locates the helper relative to t
 
 Tests create their own temporary state and do not require real session cookies. The publication check also installs the dependency lock into a fresh Windows Python 3.12 environment and parses every PowerShell script. GitHub Actions repeats offline tests on Windows. These packaging checks do not constitute a new live desktop acceptance test of every publication change.
 
-`pwsh -File tests/check_process_ownership.ps1` additionally checks that the launcher ownership guard accepts only this installation's interpreter and launcher, and rejects another interpreter, a filename prefix collision, and a missing process. It does not start or stop any process.
+`pwsh -File tests/check_process_ownership.ps1` additionally checks that the launcher ownership guard accepts this installation's interpreter or its configured Windows base-interpreter child, always requires the exact launcher, and rejects another interpreter, a filename prefix collision, and a missing process. It does not start or stop any proxy process.
 
 Not fully validated: Cowork, long real-world video/audio, complex multi-step projects, remote cloud file IDs, Linux/macOS integration, native long-context equivalence, provider-internal model identity, or native thinking signatures.
