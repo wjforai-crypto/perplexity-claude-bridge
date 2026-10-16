@@ -276,4 +276,33 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(self.post(messages=messages,tools=[TOOL]).status_code,200)
         self.assertNotIn('LOOP GUARD',self.captured[-1]['query'])
 
+    def test_loop_guard_survives_desktop_token_metadata_after_every_result(self):
+        original=self.snapshot_reads([101]*6,['same evidence']*6)
+        messages=[]
+        for message in original:
+            messages.append(message)
+            if message['role']=='user' and isinstance(message['content'],list):
+                messages.append({'role':'system','content':'<total_tokens>14990533 tokens left</total_tokens>'})
+        self.answers=[json.dumps({'text':'ok','tool_calls':[]})]
+        self.assertEqual(self.post(messages=messages,tools=[TOOL]).status_code,200)
+        self.assertIn('LOOP GUARD',self.captured[-1]['query'])
+
+    def test_recovery_notice_catches_alternating_snapshot_and_unchanged_reads(self):
+        messages=[{'role':'user','content':'Read the handoff and continue implementing.'}]
+        for i in range(4):
+            messages.extend([
+                {'role':'assistant','content':[{'type':'tool_use','id':f'h{i}','name':'Read',
+                    'input':{'file_path':'project/handoff.md'}}]},
+                {'role':'user','content':[{'type':'tool_result','tool_use_id':f'h{i}',
+                    'content':'Wasted call — file unchanged since your last Read. Refer to that earlier tool_result instead.'}]},
+                {'role':'system','content':'<total_tokens>14990533 tokens left</total_tokens>'},
+                {'role':'assistant','content':[{'type':'tool_use','id':f's{i}','name':'Read',
+                    'input':{'file_path':f'private/context-cache/hash{i}/context.txt','offset':4000+i*20,'limit':20}}]},
+                {'role':'user','content':[{'type':'tool_result','tool_use_id':f's{i}',
+                    'content':f'=== MESSAGE {i} tool_result wrapper ==='}]},
+                {'role':'system','content':'<total_tokens>14990533 tokens left</total_tokens>'}])
+        self.answers=[json.dumps({'text':'ok','tool_calls':[]})]
+        self.assertEqual(self.post(messages=messages,tools=[TOOL]).status_code,200)
+        self.assertIn('RECOVERY NOTICE',self.captured[-1]['query'])
+
 if __name__=='__main__':unittest.main()

@@ -205,3 +205,56 @@ Live proxy smoke check on 2026-10-16 at 21:14 (Asia/Shanghai):
 
 This verifies one synthetic real request and its cleanup, not the final
 Claude client long-session/video acceptance or a visual browser-history check.
+
+## 1.2.6 Desktop recovery-cycle repair — 2026-10-16
+
+User acceptance of 1.2.5 reproduced the recovery loop despite the earlier short
+tool-chain smoke test. The captured Desktop trace had 152 messages, 110 tools,
+13,146 system characters and 50 tool calls (34 Read, 16 Bash), mostly repeated
+handoff reads, listings and changing snapshot-range lookups.
+
+Two deterministic regressions failed before the repair: Desktop appends a
+`<total_tokens>` system message after each tool result, which reset the guard;
+and optional schemas / recent recovery chatter displaced previously acquired
+handoff content. A third test reproduced alternating unchanged-file notices
+and advancing snapshot ranges, which the exact-range guard alone missed.
+
+Changes:
+
+- Preserve complete client system instructions and the exact full payload.
+  Prefer the latest actual result before optional schemas or old search turns.
+  Compact duplicated bridge guidance, not client instructions. Oversized-result
+  guidance no longer sends the model back into the snapshot tail by default.
+- Store actual client results under stable content-addressed evidence paths.
+  Pin bounded exact excerpts with explicit excerpt flags and full-result paths;
+  exclude snapshot/evidence lookup wrappers and unchanged-file notices from
+  the source-evidence cache. No model-generated progress summary is used.
+- Ignore Desktop token metadata for loop counting. Detect the observed mixed
+  pattern of repeated unchanged notices plus snapshot lookups and direct
+  recovery to the actual result evidence. Advancing ranges without the mixed
+  stale-read pattern still do not trigger the exact-range guard.
+
+Offline verification: 72 unit tests pass (33 bridge, 14 computer, 9 janitor,
+9 context, 5 upload, 2 portability) plus routing/auth smoke checks. Tests cover
+the three previously failing cases, exact stable-result persistence without
+rewriting unchanged files, Windows shell snapshot paths, and full latest-result
+priority while retaining complete system instructions.
+
+Live recovery probes used the real ASI/Opus backend:
+
+- Replayed the captured 152-message trace. Two sequential reads of a stable
+  directory-result file led to a new targeted inspection of previously
+  unexamined review/baseline folders, without another context-tail scan. That
+  requested project inspection was observed, not executed by the proxy probe.
+- A controlled implementation task reused the Desktop-sized system/tool
+  catalog and included 20 old recovery turns with token metadata. The next
+  response requested Write with the correct marker from the earlier handoff;
+  the restricted test client wrote only its temporary fixture output and
+  verified the exact bytes. No production project files were changed.
+- Repeated that controlled long recovery task through the restarted local
+  1.2.6 HTTP proxy. Its first new response again requested the correct Write;
+  the fixture output was independently read back and matched the marker.
+
+These probes cover recovery behavior missed by the short smoke test. Final
+acceptance of the user's actual Desktop project and long video task remains
+separate; model behavior is not guaranteed for every future conversation.
